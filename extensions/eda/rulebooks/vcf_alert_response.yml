@@ -1,0 +1,75 @@
+---
+- name: VCF Alert Response
+  hosts: all
+  sources:
+    - name: Listen for VCF webhook events
+      vmware.vmware.vcf_webhook:
+        host: "{{ eda_webhook_host | default('0.0.0.0') }}"
+        port: "{{ eda_webhook_port | default(5000) }}"
+        token: "{{ eda_webhook_token | default(omit) }}"
+      filters:
+        - vmware.vmware.vcf_normalize: {}
+
+  rules:
+    - name: Investigate critical VCF Operations alerts
+      condition: >-
+        event.source == "vcf_operations"
+        and event.severity == "critical"
+        and event.category == "alert"
+      action:
+        run_playbook:
+          name: vmware.vmware.vcf_investigate_alert
+          extra_vars:
+            alert_name: "{{ event.event_type }}"
+            resource_name: "{{ event.object_name }}"
+            resource_type: "{{ event.object_type }}"
+            datacenter: "{{ event.datacenter }}"
+            alert_message: "{{ event.message }}"
+            alert_timestamp: "{{ event.timestamp }}"
+            vcenter_hostname: "{{ vcenter_hostname }}"
+            vcenter_username: "{{ vcenter_username }}"
+            vcenter_password: "{{ vcenter_password }}"
+            validate_certs: "{{ vcenter_validate_certs | default(false) }}"
+            notification_channel: "{{ notification_channel | default('vcf-critical') }}"
+          verbosity: 1
+
+    - name: Clean up failed VCF Automation deployments
+      condition: >-
+        event.source == "vcf_automation"
+        and event.category == "task"
+        and event.severity == "critical"
+        and "fail" in event.message.lower()
+      action:
+        run_playbook:
+          name: vmware.vmware.vcf_deployment_cleanup
+          extra_vars:
+            deployment_name: "{{ event.object_name }}"
+            deployment_type: "{{ event.object_type }}"
+            failure_message: "{{ event.message }}"
+            datacenter: "{{ event.datacenter }}"
+            vcenter_hostname: "{{ vcenter_hostname }}"
+            vcenter_username: "{{ vcenter_username }}"
+            vcenter_password: "{{ vcenter_password }}"
+            validate_certs: "{{ vcenter_validate_certs | default(false) }}"
+          verbosity: 1
+
+    - name: Scale resources on capacity threshold exceeded
+      condition: >-
+        event.category == "alert"
+        and event.severity in ("critical", "warning")
+        and "capacity" in event.message.lower()
+      action:
+        run_playbook:
+          name: vmware.vmware.vcf_capacity_scale
+          extra_vars:
+            resource_name: "{{ event.object_name }}"
+            resource_type: "{{ event.object_type }}"
+            datacenter: "{{ event.datacenter }}"
+            alert_message: "{{ event.message }}"
+            scaling_policy: "{{ scaling_policy | default('conservative') }}"
+            max_scale_factor: "{{ max_scale_factor | default(2) }}"
+            vcenter_hostname: "{{ vcenter_hostname }}"
+            vcenter_username: "{{ vcenter_username }}"
+            vcenter_password: "{{ vcenter_password }}"
+            validate_certs: "{{ vcenter_validate_certs | default(false) }}"
+          verbosity: 1

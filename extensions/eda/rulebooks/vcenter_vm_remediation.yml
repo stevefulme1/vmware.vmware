@@ -1,0 +1,81 @@
+---
+- name: vCenter VM Remediation
+  hosts: all
+  sources:
+    - name: Listen for vCenter events
+      vmware.vmware.vcenter_events:
+        vcenter_hostname: "{{ vcenter_hostname }}"
+        vcenter_username: "{{ vcenter_username }}"
+        vcenter_password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs | default(false) }}"
+        event_types:
+          - VmPoweredOffEvent
+          - EnteredMaintenanceModeEvent
+          - TaskEvent_CreateSnapshot_Task
+          - DrsVmMigratedEvent
+      filters:
+        - vmware.vmware.vcf_normalize: {}
+
+  rules:
+    - name: Restart VM on unexpected power-off
+      condition: >-
+        event.event_type == "VmPoweredOffEvent"
+        and event.category == "vm_lifecycle"
+        and event.metadata.get("UserName", "") == ""
+      action:
+        run_playbook:
+          name: vmware.vmware.vm_restart
+          extra_vars:
+            vm_name: "{{ event.object_name }}"
+            datacenter: "{{ event.datacenter }}"
+            vcenter_hostname: "{{ vcenter_hostname }}"
+            vcenter_username: "{{ vcenter_username }}"
+            vcenter_password: "{{ vcenter_password }}"
+            validate_certs: "{{ vcenter_validate_certs | default(false) }}"
+          verbosity: 1
+
+    - name: Migrate VMs when host enters maintenance mode
+      condition: >-
+        event.event_type == "EnteredMaintenanceModeEvent"
+        and event.category == "host_lifecycle"
+      action:
+        run_playbook:
+          name: vmware.vmware.vm_migrate_from_host
+          extra_vars:
+            host_name: "{{ event.object_name }}"
+            datacenter: "{{ event.datacenter }}"
+            vcenter_hostname: "{{ vcenter_hostname }}"
+            vcenter_username: "{{ vcenter_username }}"
+            vcenter_password: "{{ vcenter_password }}"
+            validate_certs: "{{ vcenter_validate_certs | default(false) }}"
+          verbosity: 1
+
+    - name: Log and notify on snapshot creation
+      condition: >-
+        event.event_type == "TaskEvent_CreateSnapshot_Task"
+        and event.category == "vm_lifecycle"
+      actions:
+        - debug:
+            msg: >-
+              Snapshot created on VM '{{ event.object_name }}'
+              in datacenter '{{ event.datacenter }}'
+              at {{ event.timestamp }}
+        - run_playbook:
+            name: vmware.vmware.notify_event
+            extra_vars:
+              notification_channel: "{{ notification_channel | default('vcf-events') }}"
+              event_summary: >-
+                Snapshot created on {{ event.object_name }}
+                by {{ event.metadata.get('UserName', 'system') }}
+              severity: "{{ event.severity }}"
+
+    - name: Log DRS VM migration details
+      condition: >-
+        event.event_type == "DrsVmMigratedEvent"
+        and event.category == "vm_lifecycle"
+      action:
+        debug:
+          msg: >-
+            DRS migrated VM '{{ event.object_name }}'
+            in datacenter '{{ event.datacenter }}'.
+            Details: {{ event.message }}

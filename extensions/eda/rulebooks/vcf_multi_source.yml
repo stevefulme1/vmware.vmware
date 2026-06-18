@@ -1,0 +1,159 @@
+---
+- name: VCF Multi-Source Correlation
+  hosts: all
+  sources:
+    - name: vCenter events
+      vmware.vmware.vcenter_events:
+        vcenter_hostname: "{{ vcenter_hostname }}"
+        vcenter_username: "{{ vcenter_username }}"
+        vcenter_password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs | default(false) }}"
+        event_types:
+          - HostDisconnectedEvent
+          - HostConnectionLostEvent
+          - VmPoweredOffEvent
+          - AlarmStatusChangedEvent
+          - EnteredMaintenanceModeEvent
+      filters:
+        - vmware.vmware.vcf_normalize: {}
+
+    - name: VCF Operations and Automation webhooks
+      vmware.vmware.vcf_webhook:
+        host: "{{ eda_webhook_host | default('0.0.0.0') }}"
+        port: "{{ eda_webhook_port | default(5000) }}"
+        token: "{{ eda_webhook_token | default(omit) }}"
+      filters:
+        - vmware.vmware.vcf_normalize: {}
+
+    - name: VCF Kafka event stream
+      vmware.vmware.vcf_kafka:
+        bootstrap_servers: "{{ kafka_bootstrap_servers }}"
+        topics:
+          - "{{ kafka_topic_prefix | default('vcf') }}.events"
+          - "{{ kafka_topic_prefix | default('vcf') }}.alerts"
+        group_id: "{{ kafka_group_id | default('ansible-eda-vcf-multi') }}"
+        security_protocol: "{{ kafka_security_protocol | default('SASL_SSL') }}"
+        sasl_mechanism: "{{ kafka_sasl_mechanism | default('PLAIN') }}"
+        sasl_username: "{{ kafka_username }}"
+        sasl_password: "{{ kafka_password }}"
+      filters:
+        - vmware.vmware.vcf_normalize: {}
+
+  rules:
+    - name: Escalate host disconnect with correlated critical alert
+      condition: >-
+        event.source == "vcenter"
+        and event.event_type == "HostDisconnectedEvent"
+        and event.severity == "critical"
+      action:
+        run_playbook:
+          name: vmware.vmware.host_disconnect_escalation
+          extra_vars:
+            host_name: "{{ event.object_name }}"
+            datacenter: "{{ event.datacenter }}"
+            disconnect_time: "{{ event.timestamp }}"
+            event_source: "{{ event.source }}"
+            vcenter_hostname: "{{ vcenter_hostname }}"
+            vcenter_username: "{{ vcenter_username }}"
+            vcenter_password: "{{ vcenter_password }}"
+            validate_certs: "{{ vcenter_validate_certs | default(false) }}"
+            escalation_channel: "{{ escalation_channel | default('vcf-escalation') }}"
+            pager_duty_key: "{{ pager_duty_key | default(omit) }}"
+          verbosity: 1
+
+    - name: Escalate VCF Operations critical alert matching host issues
+      condition: >-
+        event.source == "vcf_operations"
+        and event.severity == "critical"
+        and event.object_type == "host"
+      action:
+        run_playbook:
+          name: vmware.vmware.host_disconnect_escalation
+          extra_vars:
+            host_name: "{{ event.object_name }}"
+            datacenter: "{{ event.datacenter }}"
+            alert_name: "{{ event.event_type }}"
+            alert_message: "{{ event.message }}"
+            event_source: "{{ event.source }}"
+            vcenter_hostname: "{{ vcenter_hostname }}"
+            vcenter_username: "{{ vcenter_username }}"
+            vcenter_password: "{{ vcenter_password }}"
+            validate_certs: "{{ vcenter_validate_certs | default(false) }}"
+            escalation_channel: "{{ escalation_channel | default('vcf-escalation') }}"
+            pager_duty_key: "{{ pager_duty_key | default(omit) }}"
+          verbosity: 1
+
+    - name: Correlate Kafka critical events for same resource
+      condition: >-
+        event.source == "kafka"
+        and event.severity == "critical"
+        and event.object_name != ""
+      action:
+        run_playbook:
+          name: vmware.vmware.correlated_event_handler
+          extra_vars:
+            resource_name: "{{ event.object_name }}"
+            resource_type: "{{ event.object_type }}"
+            event_type: "{{ event.event_type }}"
+            event_message: "{{ event.message }}"
+            datacenter: "{{ event.datacenter }}"
+            kafka_topic: "{{ event.metadata.topic | default('') }}"
+            event_source: "{{ event.source }}"
+            vcenter_hostname: "{{ vcenter_hostname }}"
+            vcenter_username: "{{ vcenter_username }}"
+            vcenter_password: "{{ vcenter_password }}"
+            validate_certs: "{{ vcenter_validate_certs | default(false) }}"
+
+    - name: Track all critical events across sources for audit
+      condition: >-
+        event.severity == "critical"
+      action:
+        run_playbook:
+          name: vmware.vmware.audit_critical_event
+          extra_vars:
+            event_source: "{{ event.source }}"
+            event_type: "{{ event.event_type }}"
+            category: "{{ event.category }}"
+            resource_name: "{{ event.object_name }}"
+            resource_type: "{{ event.object_type }}"
+            datacenter: "{{ event.datacenter }}"
+            message: "{{ event.message }}"
+            timestamp: "{{ event.timestamp }}"
+            audit_log_path: "{{ audit_log_path | default('/var/log/vcf-eda/critical-events.log') }}"
+
+    - name: Auto-remediate VM power-off from any source
+      condition: >-
+        event.category == "vm_lifecycle"
+        and event.event_type in (
+          "VmPoweredOffEvent",
+          "vm.powered.off",
+          "VM_POWER_OFF"
+        )
+        and event.object_type == "vm"
+      action:
+        run_playbook:
+          name: vmware.vmware.vm_restart
+          extra_vars:
+            vm_name: "{{ event.object_name }}"
+            datacenter: "{{ event.datacenter }}"
+            event_source: "{{ event.source }}"
+            vcenter_hostname: "{{ vcenter_hostname }}"
+            vcenter_username: "{{ vcenter_username }}"
+            vcenter_password: "{{ vcenter_password }}"
+            validate_certs: "{{ vcenter_validate_certs | default(false) }}"
+          verbosity: 1
+
+    - name: Notify on any warning-level storage event
+      condition: >-
+        event.category == "storage"
+        and event.severity in ("critical", "warning")
+      action:
+        run_playbook:
+          name: vmware.vmware.notify_event
+          extra_vars:
+            notification_channel: "{{ notification_channel | default('vcf-storage') }}"
+            event_summary: >-
+              STORAGE {{ event.severity | upper }}: {{ event.event_type }}
+              on {{ event.object_name }} ({{ event.source }})
+              - {{ event.message }}
+            severity: "{{ event.severity }}"

@@ -1,0 +1,73 @@
+---
+- name: VCF Kafka Event Monitoring
+  hosts: all
+  sources:
+    - name: Listen for VCF Kafka events
+      vmware.vmware.vcf_kafka:
+        bootstrap_servers: "{{ kafka_bootstrap_servers }}"
+        topics:
+          - "{{ kafka_topic_prefix | default('vcf') }}.events"
+          - "{{ kafka_topic_prefix | default('vcf') }}.alerts"
+          - "{{ kafka_topic_prefix | default('vcf') }}.compliance"
+        group_id: "{{ kafka_group_id | default('ansible-eda-vcf') }}"
+        security_protocol: "{{ kafka_security_protocol | default('SASL_SSL') }}"
+        sasl_mechanism: "{{ kafka_sasl_mechanism | default('PLAIN') }}"
+        sasl_username: "{{ kafka_username }}"
+        sasl_password: "{{ kafka_password }}"
+      filters:
+        - vmware.vmware.vcf_normalize: {}
+
+  rules:
+    - name: Send notification on critical events
+      condition: >-
+        event.severity == "critical"
+      action:
+        run_playbook:
+          name: vmware.vmware.notify_event
+          extra_vars:
+            notification_channel: "{{ notification_channel | default('vcf-critical') }}"
+            event_summary: >-
+              CRITICAL [{{ event.source }}]: {{ event.event_type }}
+              on {{ event.object_type }} '{{ event.object_name }}'
+              - {{ event.message }}
+            severity: "{{ event.severity }}"
+            timestamp: "{{ event.timestamp }}"
+            datacenter: "{{ event.datacenter }}"
+            kafka_topic: "{{ event.metadata.topic | default('') }}"
+
+    - name: Update CMDB on VM lifecycle events
+      condition: >-
+        event.category == "vm_lifecycle"
+        and event.object_type == "vm"
+        and event.object_name != ""
+      action:
+        run_playbook:
+          name: vmware.vmware.cmdb_update
+          extra_vars:
+            vm_name: "{{ event.object_name }}"
+            event_type: "{{ event.event_type }}"
+            datacenter: "{{ event.datacenter }}"
+            timestamp: "{{ event.timestamp }}"
+            cmdb_endpoint: "{{ cmdb_endpoint }}"
+            cmdb_api_key: "{{ cmdb_api_key }}"
+            cmdb_verify_ssl: "{{ cmdb_verify_ssl | default(true) }}"
+
+    - name: Trigger remediation on compliance violation
+      condition: >-
+        event.category == "compliance"
+        and event.severity in ("critical", "warning")
+      action:
+        run_playbook:
+          name: vmware.vmware.compliance_remediate
+          extra_vars:
+            resource_name: "{{ event.object_name }}"
+            resource_type: "{{ event.object_type }}"
+            violation_type: "{{ event.event_type }}"
+            violation_message: "{{ event.message }}"
+            datacenter: "{{ event.datacenter }}"
+            auto_remediate: "{{ compliance_auto_remediate | default(false) }}"
+            vcenter_hostname: "{{ vcenter_hostname }}"
+            vcenter_username: "{{ vcenter_username }}"
+            vcenter_password: "{{ vcenter_password }}"
+            validate_certs: "{{ vcenter_validate_certs | default(false) }}"
+          verbosity: 1
